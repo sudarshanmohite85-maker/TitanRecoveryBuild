@@ -13,16 +13,14 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 # -----------------------------------------------------------------------------
 # CONSTANTS & SIGNATURES
 # -----------------------------------------------------------------------------
-# Common file signatures (Magic Numbers)
 FILE_SIGNATURES = {
     'jpg':  (b'\xFF\xD8\xFF', b'\xFF\xD9'),
     'png':  (b'\x89\x50\x4E\x47\x0D\x0A\x1A\x0A', b'\x49\x45\x4E\x44\xAE\x42\x60\x82'),
-    'pdf':  (b'\x25\x50\x44\x46', b'\x25\x25\x45\x4F\x46'), # %PDF- ... %%EOF
-    'zip':  (b'\x50\x4B\x03\x04', None), # PK.. (Also covers DOCX, XLSX, JAR)
-    'mp4':  (b'\x00\x00\x00\x18\x66\x74\x79\x70', None) # ftyp atom
+    'pdf':  (b'\x25\x50\x44\x46', b'\x25\x25\x45\x4F\x46'), 
+    'zip':  (b'\x50\x4B\x03\x04', None),
+    'mp4':  (b'\x00\x00\x00\x18\x66\x74\x79\x70', None)
 }
 
-# Block size for reading (optimized for performance)
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 SECTOR_SIZE = 512
 
@@ -30,25 +28,18 @@ SECTOR_SIZE = 512
 # HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
 def is_admin():
-    """Check if the script is running with Admin privileges."""
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
     except:
         return False
 
 def get_drives():
-    """
-    Detect removable drives on Windows.
-    Returns a list of tuples: (Letter, Path)
-    """
     drives = []
     bitmask = ctypes.windll.kernel32.GetLogicalDrives()
     for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
         if bitmask & 1:
             drive_path = f"{letter}:\\"
             drive_type = ctypes.windll.kernel32.GetDriveTypeW(drive_path)
-            # DRIVE_REMOVABLE = 2, DRIVE_FIXED = 3. 
-            # We allow both for testing, but in prod you might limit to removable.
             if drive_type == 2 or drive_type == 3: 
                 drives.append((letter, f"\\\\.\\{letter}:"))
         bitmask >>= 1
@@ -74,8 +65,6 @@ class RecoveryWorker(QThread):
         try:
             self.status_update.emit(f"Opening drive {self.drive_path} in READ-ONLY mode...")
             
-            # Open device in binary read mode
-            # On Windows, this requires Admin rights
             try:
                 disk = open(self.drive_path, 'rb')
             except PermissionError:
@@ -85,50 +74,39 @@ class RecoveryWorker(QThread):
                 self.error_occurred.emit("Drive not found or inaccessible.")
                 return
 
-           # FIXED: Set manual size to bypass Windows error
-            disk_size = 250 * 1024 * 1024 * 1024  # 250 GB manual limit
+            # FIXED 1: Manual Drive Size (Bypasses seek error)
+            disk_size = 250 * 1024 * 1024 * 1024 # Assumed 250GB limit
             
-            self.status_update.emit(f"Drive Size: {disk_size / (1024*1024*1024):.2f} GB. Starting Deep Scan...")
+            self.status_update.emit(f"Scanning... (Please wait, this may take hours)")
 
             offset = 0
             files_found_count = 0
             
-            # Dictionary to track open file handles during carving
-            # Structure: { 'ext': {'start': offset, 'data': bytearray, 'max_size': int} }
-            # Since this is a simple carver, we will process sequentially for simplicity.
-            
-            # Simple Carving Logic:
-            # 1. Read chunks
-            # 2. Search for signatures in the chunk
-            # 3. If header found, start capturing bytes
-            
             while offset < disk_size and self.is_running:
-                # Update Progress
                 if offset % (10 * CHUNK_SIZE) == 0:
                     percent = int((offset / disk_size) * 100)
+                    if percent > 100: percent = 99
                     self.progress_update.emit(percent)
 
                 try:
+                    # Windows Requirement: Read must start at sector boundary.
+                    # Our 'offset' increments by CHUNK_SIZE (aligned), so this is safe.
                     data = disk.read(CHUNK_SIZE)
                     if not data:
                         break
                 except OSError:
-                    # Sector read error, skip block
                     offset += CHUNK_SIZE
-                    disk.seek(offset)
                     continue
 
-                # Scan the chunk for signatures
                 for ext, (header, footer) in FILE_SIGNATURES.items():
                     pos = data.find(header)
                     
                     if pos != -1:
-                        # Found a potential file start
                         global_pos = offset + pos
                         self.status_update.emit(f"Found {ext.upper()} header at offset {global_pos}")
                         
-                        # Attempt to recover (Carve)
-                        recovered_data = self.carve_file(disk, global_pos, header, footer)
+                        # FIXED 2: Aligned Read for Extraction
+                        recovered_data = self.safe_carve(disk, global_pos, header, footer)
                         
                         if recovered_data:
                             filename = f"recovered_{global_pos}.{ext}"
@@ -155,50 +133,59 @@ class RecoveryWorker(QThread):
         except Exception as e:
             self.error_occurred.emit(str(e))
 
-    def carve_file(self, disk_handle, start_pos, header, footer, max_size=10*1024*1024):
+    def safe_carve(self, disk_handle, start_pos, header, footer, max_size=10*1024*1024):
         """
-        Reads from disk starting at header until footer is found or max_size reached.
+        Safely extracts data by handling Windows Sector Alignment requirements.
         """
-        current_pos = disk_handle.tell() # Save current scan position
+        # Save where the main scanner is
+        saved_scan_pos = disk_handle.tell()
         
-        disk_handle.seek(start_pos)
-        buffer = bytearray()
+        # MATH: Calculate the nearest previous sector (Multiple of 512)
+        aligned_start = (start_pos // SECTOR_SIZE) * SECTOR_SIZE
+        diff = start_pos - aligned_start  # The bytes we need to skip later
         
-        # Read initial chunk
-        chunk = disk_handle.read(min(4096, max_size))
-        buffer.extend(chunk)
-        
-        # If we have a footer, keep reading until we find it
-        if footer:
-            search_window = 0
-            while len(buffer) < max_size:
-                # check for footer in the recently added bytes
-                # We search from end of buffer back to search_window
-                footer_pos = buffer.find(footer, search_window)
-                
-                if footer_pos != -1:
-                    # Footer found! Trim buffer to include footer
-                    buffer = buffer[:footer_pos + len(footer)]
-                    break
-                
-                search_window = max(0, len(buffer) - len(footer) - 1)
-                
-                new_chunk = disk_handle.read(4096)
-                if not new_chunk:
-                    break
-                buffer.extend(new_chunk)
-        else:
-            # If no footer (like ZIP sometimes), verify by header struct or just grab fixed size
-            # For simplicity in this demo, we read a fixed 2MB for footerless files
-            extra = disk_handle.read(2 * 1024 * 1024)
-            buffer.extend(extra)
+        try:
+            # Jump to the ALIGNED position (Safe for Windows)
+            disk_handle.seek(aligned_start)
+            
+            # Read enough data to cover the file + the small alignment gap
+            buffer = bytearray()
+            read_limit = max_size + diff
+            
+            chunk = disk_handle.read(min(4096, read_limit))
+            buffer.extend(chunk)
+            
+            # Logic to find footer...
+            if footer:
+                while len(buffer) < read_limit:
+                    footer_pos = buffer.find(footer)
+                    if footer_pos != -1:
+                        buffer = buffer[:footer_pos + len(footer)]
+                        break
+                    
+                    new_chunk = disk_handle.read(4096)
+                    if not new_chunk: break
+                    buffer.extend(new_chunk)
+            else:
+                extra = disk_handle.read(2 * 1024 * 1024)
+                buffer.extend(extra)
 
-        # Restore position for main loop
-        disk_handle.seek(current_pos)
-        
-        if len(buffer) > 0:
-            return buffer
-        return None
+            # Restore the main scanner position
+            disk_handle.seek(saved_scan_pos)
+
+            # TRIM: Remove the extra bytes we read due to alignment
+            valid_data = buffer[diff:]
+            if len(valid_data) > 0:
+                return valid_data
+            return None
+
+        except OSError:
+            # If carving fails, just return None and keep scanning
+            try:
+                disk_handle.seek(saved_scan_pos)
+            except:
+                pass
+            return None
 
     def stop(self):
         self.is_running = False
@@ -234,12 +221,10 @@ class RecoveryApp(QMainWindow):
         main_widget = QWidget()
         layout = QVBoxLayout()
         
-        # Header
         header = QLabel("Deep Scan Recovery Tool")
         header.setStyleSheet("font-size: 20px; font-weight: bold; color: #333;")
         layout.addWidget(header)
 
-        # Drive Selection
         drive_layout = QHBoxLayout()
         self.drive_combo = QComboBox()
         self.refresh_drives()
@@ -252,7 +237,6 @@ class RecoveryApp(QMainWindow):
         drive_layout.addWidget(refresh_btn)
         layout.addLayout(drive_layout)
 
-        # Output Selection
         dest_layout = QHBoxLayout()
         self.lbl_dest = QLabel("No output folder selected")
         btn_dest = QPushButton("Select Output Folder")
@@ -263,13 +247,11 @@ class RecoveryApp(QMainWindow):
         dest_layout.addStretch()
         layout.addLayout(dest_layout)
 
-        # Controls
         self.btn_scan = QPushButton("Start Deep Scan")
         self.btn_scan.clicked.connect(self.start_scan)
         self.btn_scan.setEnabled(False)
         layout.addWidget(self.btn_scan)
 
-        # Progress
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         layout.addWidget(self.progress_bar)
@@ -277,7 +259,6 @@ class RecoveryApp(QMainWindow):
         self.status_lbl = QLabel("Ready")
         layout.addWidget(self.status_lbl)
 
-        # Results Table
         self.table = QTableWidget()
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["Filename", "Size", "Type", "Status"])
@@ -314,24 +295,20 @@ class RecoveryApp(QMainWindow):
         drive_path = self.drive_combo.currentData()
         if not drive_path:
             return
-
-        # Sanity Check: Don't save to the same drive being scanned
-        if drive_path[4] == self.save_directory[0]: # Simple drive letter check (e.g. 'E' vs 'E')
-            QMessageBox.warning(self, "Warning", "Don't save recovered files to the same drive you are scanning! Data overwriting will occur.")
+        if drive_path[4] == self.save_directory[0]:
+            QMessageBox.warning(self, "Warning", "Don't save recovered files to the same drive you are scanning!")
             return
 
         self.table.setRowCount(0)
         self.btn_scan.setEnabled(False)
         self.btn_scan.setText("Scanning...")
         
-        # Initialize Worker
         self.worker = RecoveryWorker(drive_path, self.save_directory)
         self.worker.progress_update.connect(self.progress_bar.setValue)
         self.worker.status_update.connect(self.status_lbl.setText)
         self.worker.file_found.connect(self.add_table_row)
         self.worker.finished_scan.connect(self.scan_finished)
         self.worker.error_occurred.connect(self.scan_error)
-        
         self.worker.start()
 
     def add_table_row(self, file_data):
@@ -345,19 +322,15 @@ class RecoveryApp(QMainWindow):
     def scan_finished(self):
         self.btn_scan.setEnabled(True)
         self.btn_scan.setText("Start Deep Scan")
-        QMessageBox.information(self, "Success", "Scan completed successfully.")
+        QMessageBox.information(self, "Success", "Scan completed.")
 
     def scan_error(self, msg):
         self.btn_scan.setEnabled(True)
         self.btn_scan.setText("Start Deep Scan")
         QMessageBox.critical(self, "Error", msg)
 
-# -----------------------------------------------------------------------------
-# ENTRY POINT
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     if not is_admin():
-        # Re-run the program with admin rights
         ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
     else:
         app = QApplication(sys.argv)
