@@ -11,17 +11,22 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 # -----------------------------------------------------------------------------
-# CONSTANTS & SIGNATURES
+# CONSTANTS & SIGNATURES (UPDATED FOR VIDEO)
 # -----------------------------------------------------------------------------
 FILE_SIGNATURES = {
     'jpg':  (b'\xFF\xD8\xFF', b'\xFF\xD9'),
     'png':  (b'\x89\x50\x4E\x47\x0D\x0A\x1A\x0A', b'\x49\x45\x4E\x44\xAE\x42\x60\x82'),
     'pdf':  (b'\x25\x50\x44\x46', b'\x25\x25\x45\x4F\x46'), 
     'zip':  (b'\x50\x4B\x03\x04', None),
-    'mp4':  (b'\x00\x00\x00\x18\x66\x74\x79\x70', None)
+    
+    # VIDEO FORMATS
+    'mp4':  (b'\x66\x74\x79\x70', None), # Generic 'ftyp' signature (works for MOV too)
+    'avi':  (b'\x52\x49\x46\x46', None), # 'RIFF'
+    'mkv':  (b'\x1A\x45\xDF\xA3', None)  # Matroska
 }
 
-CHUNK_SIZE = 1024 * 1024  # 1 MB
+# INCREASED CHUNK SIZE FOR SPEED
+CHUNK_SIZE = 2 * 1024 * 1024  # 2 MB read speed
 SECTOR_SIZE = 512
 
 # -----------------------------------------------------------------------------
@@ -74,23 +79,21 @@ class RecoveryWorker(QThread):
                 self.error_occurred.emit("Drive not found or inaccessible.")
                 return
 
-            # FIXED 1: Manual Drive Size (Bypasses seek error)
-            disk_size = 250 * 1024 * 1024 * 1024 # Assumed 250GB limit
+            # Manual Drive Size (250GB Limit)
+            disk_size = 250 * 1024 * 1024 * 1024 
             
-            self.status_update.emit(f"Scanning... (Please wait, this may take hours)")
+            self.status_update.emit(f"Scanning... (Looking for Videos & Images)")
 
             offset = 0
             files_found_count = 0
             
             while offset < disk_size and self.is_running:
-                if offset % (10 * CHUNK_SIZE) == 0:
+                if offset % (20 * CHUNK_SIZE) == 0:
                     percent = int((offset / disk_size) * 100)
                     if percent > 100: percent = 99
                     self.progress_update.emit(percent)
 
                 try:
-                    # Windows Requirement: Read must start at sector boundary.
-                    # Our 'offset' increments by CHUNK_SIZE (aligned), so this is safe.
                     data = disk.read(CHUNK_SIZE)
                     if not data:
                         break
@@ -105,8 +108,12 @@ class RecoveryWorker(QThread):
                         global_pos = offset + pos
                         self.status_update.emit(f"Found {ext.upper()} header at offset {global_pos}")
                         
-                        # FIXED 2: Aligned Read for Extraction
-                        recovered_data = self.safe_carve(disk, global_pos, header, footer)
+                        # LOGIC: If it's a video, allow 1GB size. If image, allow 20MB.
+                        current_limit = 1024 * 1024 * 1024 # 1 GB for videos
+                        if ext in ['jpg', 'png', 'pdf']:
+                            current_limit = 20 * 1024 * 1024 # 20 MB for images
+
+                        recovered_data = self.safe_carve(disk, global_pos, header, footer, current_limit)
                         
                         if recovered_data:
                             filename = f"recovered_{global_pos}.{ext}"
@@ -118,7 +125,7 @@ class RecoveryWorker(QThread):
                             files_found_count += 1
                             self.file_found.emit({
                                 'name': filename,
-                                'size': f"{len(recovered_data)/1024:.2f} KB",
+                                'size': f"{len(recovered_data)/(1024*1024):.2f} MB",
                                 'type': ext.upper(),
                                 'status': 'Recovered'
                             })
@@ -133,54 +140,48 @@ class RecoveryWorker(QThread):
         except Exception as e:
             self.error_occurred.emit(str(e))
 
-    def safe_carve(self, disk_handle, start_pos, header, footer, max_size=10*1024*1024):
-        """
-        Safely extracts data by handling Windows Sector Alignment requirements.
-        """
-        # Save where the main scanner is
+    def safe_carve(self, disk_handle, start_pos, header, footer, max_size):
         saved_scan_pos = disk_handle.tell()
         
-        # MATH: Calculate the nearest previous sector (Multiple of 512)
+        # Windows Alignment Logic
         aligned_start = (start_pos // SECTOR_SIZE) * SECTOR_SIZE
-        diff = start_pos - aligned_start  # The bytes we need to skip later
+        diff = start_pos - aligned_start 
         
         try:
-            # Jump to the ALIGNED position (Safe for Windows)
             disk_handle.seek(aligned_start)
             
-            # Read enough data to cover the file + the small alignment gap
             buffer = bytearray()
-            read_limit = max_size + diff
-            
-            chunk = disk_handle.read(min(4096, read_limit))
+            # Read first chunk
+            chunk = disk_handle.read(min(1024*1024, max_size + diff)) 
             buffer.extend(chunk)
             
-            # Logic to find footer...
+            # If footer exists, look for it. If not, read until max_size (Blind Carving)
             if footer:
-                while len(buffer) < read_limit:
+                while len(buffer) < max_size:
                     footer_pos = buffer.find(footer)
                     if footer_pos != -1:
                         buffer = buffer[:footer_pos + len(footer)]
                         break
                     
-                    new_chunk = disk_handle.read(4096)
+                    new_chunk = disk_handle.read(1024*1024) # Read 1MB at a time
                     if not new_chunk: break
                     buffer.extend(new_chunk)
             else:
-                extra = disk_handle.read(2 * 1024 * 1024)
-                buffer.extend(extra)
+                # For MP4/AVI without explicit footer, just read the max limit
+                # This is "Blind Carving" - simplistic but effective for raw recovery
+                remaining = max_size - len(buffer)
+                if remaining > 0:
+                   extra = disk_handle.read(remaining)
+                   buffer.extend(extra)
 
-            # Restore the main scanner position
             disk_handle.seek(saved_scan_pos)
 
-            # TRIM: Remove the extra bytes we read due to alignment
             valid_data = buffer[diff:]
             if len(valid_data) > 0:
                 return valid_data
             return None
 
         except OSError:
-            # If carving fails, just return None and keep scanning
             try:
                 disk_handle.seek(saved_scan_pos)
             except:
@@ -191,12 +192,12 @@ class RecoveryWorker(QThread):
         self.is_running = False
 
 # -----------------------------------------------------------------------------
-# MAIN WINDOW (GUI)
+# GUI CLASS (Standard)
 # -----------------------------------------------------------------------------
 class RecoveryApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Titan Recovery - USB Forensics Tool")
+        self.setWindowTitle("Titan Recovery - USB Forensics Tool (Video Edition)")
         self.resize(900, 600)
         self.setStyleSheet("""
             QMainWindow { background-color: #f0f0f0; }
@@ -207,21 +208,19 @@ class RecoveryApp(QMainWindow):
                 padding: 8px; border-radius: 4px; font-weight: bold;
             }
             QPushButton:hover { background-color: #005a9e; }
-            QPushButton:disabled { background-color: #cccccc; }
             QProgressBar { border: 1px solid #bbb; border-radius: 4px; text-align: center; }
             QProgressBar::chunk { background-color: #00CC6A; }
         """)
 
         self.worker = None
         self.save_directory = ""
-
         self.init_ui()
 
     def init_ui(self):
         main_widget = QWidget()
         layout = QVBoxLayout()
         
-        header = QLabel("Deep Scan Recovery Tool")
+        header = QLabel("Titan Deep Scan (Video Support Enabled)")
         header.setStyleSheet("font-size: 20px; font-weight: bold; color: #333;")
         layout.addWidget(header)
 
@@ -293,10 +292,9 @@ class RecoveryApp(QMainWindow):
 
     def start_scan(self):
         drive_path = self.drive_combo.currentData()
-        if not drive_path:
-            return
+        if not drive_path: return
         if drive_path[4] == self.save_directory[0]:
-            QMessageBox.warning(self, "Warning", "Don't save recovered files to the same drive you are scanning!")
+            QMessageBox.warning(self, "Warning", "Don't save to the same drive!")
             return
 
         self.table.setRowCount(0)
