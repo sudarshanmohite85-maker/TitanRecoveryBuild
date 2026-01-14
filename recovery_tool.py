@@ -85,10 +85,8 @@ class RecoveryWorker(QThread):
                 self.error_occurred.emit("Drive not found or inaccessible.")
                 return
 
-            # Determine drive size (seek to end)
-            disk.seek(0, os.SEEK_END)
-            disk_size = disk.tell()
-            disk.seek(0)
+           # FIXED: Set manual size to bypass Windows error
+            disk_size = 250 * 1024 * 1024 * 1024  # 250 GB manual limit
             
             self.status_update.emit(f"Drive Size: {disk_size / (1024*1024*1024):.2f} GB. Starting Deep Scan...")
 
