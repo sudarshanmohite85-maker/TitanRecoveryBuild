@@ -13,17 +13,18 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 # -----------------------------------------------------------------------------
 # CONSTANTS & SIGNATURES
 # -----------------------------------------------------------------------------
+# Note: For MP4, we detect 'ftyp' which is usually at offset 4. 
+# The actual file starts 4 bytes before this signature.
 FILE_SIGNATURES = {
     'jpg':  (b'\xFF\xD8\xFF', b'\xFF\xD9'),
     'png':  (b'\x89\x50\x4E\x47\x0D\x0A\x1A\x0A', b'\x49\x45\x4E\x44\xAE\x42\x60\x82'),
     'pdf':  (b'\x25\x50\x44\x46', b'\x25\x25\x45\x4F\x46'), 
-    'zip':  (b'\x50\x4B\x03\x04', None), # Covers ZIP, DOCX, XLSX
-    'mp4':  (b'\x66\x74\x79\x70', None),
-    'avi':  (b'\x52\x49\x46\x46', None),
-    'mkv':  (b'\x1A\x45\xDF\xA3', None)
+    'zip':  (b'\x50\x4B\x03\x04', None),
+    'mp4':  (b'\x66\x74\x79\x70', None), # 'ftyp'
+    'avi':  (b'\x52\x49\x46\x46', None), # 'RIFF'
 }
 
-CHUNK_SIZE = 2 * 1024 * 1024  
+CHUNK_SIZE = 2 * 1024 * 1024 
 SECTOR_SIZE = 512
 
 # -----------------------------------------------------------------------------
@@ -46,6 +47,80 @@ def get_drives():
                 drives.append((letter, f"\\\\.\\{letter}:"))
         bitmask >>= 1
     return drives
+
+# -----------------------------------------------------------------------------
+# ADVANCED VIDEO PARSERS (THE FIX)
+# -----------------------------------------------------------------------------
+def get_mp4_size(disk, start_offset):
+    """
+    Parses MP4 atoms to calculate EXACT file size.
+    Returns: exact size in bytes, or None if invalid.
+    """
+    try:
+        current_pos = start_offset
+        total_size = 0
+        
+        # Max reasonable size to prevent loops (2GB)
+        max_scan = 2 * 1024 * 1024 * 1024
+        
+        disk.seek(start_offset)
+        
+        while total_size < max_scan:
+            # Read Atom Size (4 bytes Big Endian) and Name (4 bytes)
+            header = disk.read(8)
+            if len(header) < 8: break
+            
+            atom_size = struct.unpack('>I', header[0:4])[0]
+            atom_name = header[4:8]
+            
+            # Validation: Atom size must be at least 8 bytes (header itself)
+            if atom_size < 8: 
+                # usually 0 or 1 means 'till end of file' or '64bit size', complex cases.
+                # For basic recovery, we treat as end or invalid.
+                if atom_size == 0: break 
+                return None 
+
+            total_size += atom_size
+            
+            # Common valid atoms. If we see garbage, stop.
+            valid_atoms = [b'ftyp', b'moov', b'mdat', b'free', b'skip', b'wide', b'pnot', b'udta', b'uuid']
+            if atom_name not in valid_atoms and total_size == atom_size:
+                # First atom matches signature but isn't valid?
+                return None
+
+            # 'moov' or 'mdat' usually marks the end of data for recovery purposes
+            # but we continue summing until we hit EOF logic or weird data
+            
+            # Jump to next atom
+            current_pos += atom_size
+            disk.seek(current_pos)
+            
+            # If we successfully parsed a few atoms and size looks real (e.g. > 1MB), good.
+            # We break if we hit read errors or end of drive.
+
+        if total_size > 1024: # Minimal valid video size
+            return total_size
+            
+    except Exception:
+        pass
+    
+    return None
+
+def get_avi_size(disk, start_offset):
+    """
+    Parses AVI RIFF header for size.
+    """
+    try:
+        disk.seek(start_offset + 4) # Skip 'RIFF'
+        # Read Size (4 bytes Little Endian)
+        size_bytes = disk.read(4)
+        if len(size_bytes) < 4: return None
+        
+        # RIFF size = file size - 8 bytes
+        riff_size = struct.unpack('<I', size_bytes)[0]
+        return riff_size + 8
+    except:
+        return None
 
 # -----------------------------------------------------------------------------
 # RECOVERY ENGINE
@@ -77,8 +152,7 @@ class RecoveryWorker(QThread):
                 return
 
             disk_size = 250 * 1024 * 1024 * 1024 
-            
-            self.status_update.emit(f"Scanning... (Smart Size Limits Active)")
+            self.status_update.emit(f"Scanning... (Smart Video Analysis Active)")
 
             offset = 0
             files_found_count = 0
@@ -101,20 +175,48 @@ class RecoveryWorker(QThread):
                     
                     if pos != -1:
                         global_pos = offset + pos
-                        self.status_update.emit(f"Found {ext.upper()} at {global_pos}")
+                        file_start_pos = global_pos
                         
-                        # --- SMART LIMITS ---
-                        # Default large limit for Videos
-                        limit = 1024 * 1024 * 1024 # 1 GB
+                        # --- SPECIAL HANDLING FOR MP4 ---
+                        # 'ftyp' is usually at offset 4. The file starts 4 bytes earlier.
+                        if ext == 'mp4':
+                            file_start_pos = global_pos - 4
                         
-                        # Strict limit for ZIP/Office/Images to prevent "Junk Bloat"
-                        if ext in ['zip', 'jpg', 'png', 'pdf']:
-                            limit = 50 * 1024 * 1024 # Max 50 MB for non-video files
+                        self.status_update.emit(f"Analyzing {ext.upper()} at {file_start_pos}")
+                        
+                        # --- SMART SIZE CALCULATION ---
+                        exact_size = None
+                        
+                        # Save position to restore later
+                        saved_pos = disk.tell()
+                        
+                        if ext == 'mp4':
+                            exact_size = get_mp4_size(disk, file_start_pos)
+                        elif ext == 'avi':
+                            exact_size = get_avi_size(disk, file_start_pos)
+                        
+                        # Restore position
+                        disk.seek(saved_pos)
 
-                        recovered_data = self.safe_carve(disk, global_pos, header, footer, limit)
+                        # Set Limits based on analysis
+                        if exact_size:
+                            limit = exact_size
+                            status_msg = "Exact Size"
+                        else:
+                            # Fallback limits if parsing failed
+                            if ext in ['mp4', 'avi']:
+                                limit = 500 * 1024 * 1024 # 500 MB fallback
+                            elif ext in ['zip', 'jpg', 'png', 'pdf']:
+                                limit = 50 * 1024 * 1024 # 50 MB limit
+                            else:
+                                limit = 10 * 1024 * 1024
+                            status_msg = "Est. Size"
+
+                        # Perform Extraction
+                        recovered_data = self.safe_carve(disk, file_start_pos, header, footer, limit, ext)
                         
                         if recovered_data:
-                            filename = f"recovered_{global_pos}.{ext}"
+                            filename = f"recovered_{file_start_pos}.{ext}"
                             filepath = os.path.join(self.save_dir, filename)
                             
                             with open(filepath, 'wb') as f:
@@ -125,7 +227,7 @@ class RecoveryWorker(QThread):
                                 'name': filename,
                                 'size': f"{len(recovered_data)/(1024*1024):.2f} MB",
                                 'type': ext.upper(),
-                                'status': 'Recovered'
+                                'status': status_msg
                             })
 
                 offset += CHUNK_SIZE
@@ -138,8 +240,10 @@ class RecoveryWorker(QThread):
         except Exception as e:
             self.error_occurred.emit(str(e))
 
-    def safe_carve(self, disk_handle, start_pos, header, footer, max_size):
+    def safe_carve(self, disk_handle, start_pos, header, footer, max_size, ext):
         saved_scan_pos = disk_handle.tell()
+        
+        # Alignment Logic
         aligned_start = (start_pos // SECTOR_SIZE) * SECTOR_SIZE
         diff = start_pos - aligned_start 
         
@@ -148,11 +252,14 @@ class RecoveryWorker(QThread):
             buffer = bytearray()
             
             # Read first chunk
-            chunk = disk_handle.read(min(1024*1024, max_size + diff)) 
+            chunk = disk_handle.read(min(2*1024*1024, max_size + diff)) 
             buffer.extend(chunk)
             
-            # Carving Loop
+            # If we have a footer (JPG/PNG), assume max_size is a safety limit
+            # If NO footer (MP4/ZIP), assume max_size is the TARGET size.
+            
             if footer:
+                # Look for footer
                 while len(buffer) < max_size:
                     footer_pos = buffer.find(footer)
                     if footer_pos != -1:
@@ -162,15 +269,30 @@ class RecoveryWorker(QThread):
                     if not new_chunk: break
                     buffer.extend(new_chunk)
             else:
-                # Blind carve until max_limit
-                remaining = max_size - len(buffer)
+                # Blind carve until EXACT max_size is reached
+                # Calculate what we still need to reach 'max_size'
+                # Buffer currently has 'len(buffer)' bytes.
+                # Valid data starts at 'diff'.
+                # So we have (len(buffer) - diff) valid bytes.
+                current_valid_len = len(buffer) - diff
+                remaining = max_size - current_valid_len
+                
                 if remaining > 0:
-                   extra = disk_handle.read(remaining)
-                   buffer.extend(extra)
+                    # Read the rest in blocks
+                    while remaining > 0:
+                        read_amt = min(2*1024*1024, remaining)
+                        extra = disk_handle.read(read_amt)
+                        if not extra: break
+                        buffer.extend(extra)
+                        remaining -= len(extra)
 
             disk_handle.seek(saved_scan_pos)
 
             valid_data = buffer[diff:]
+            # Trim strictly to max_size if it was an exact calculation
+            if len(valid_data) > max_size:
+                valid_data = valid_data[:max_size]
+                
             return valid_data if len(valid_data) > 0 else None
 
         except:
@@ -187,8 +309,8 @@ class RecoveryWorker(QThread):
 class RecoveryApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Titan Recovery - Smart Video Edition")
-        self.resize(900, 600)
+        self.setWindowTitle("Titan Recovery - Smart Video Edition 2.0")
+        self.resize(1000, 600)
         self.setStyleSheet("""
             QMainWindow { background-color: #f0f0f0; }
             QLabel { font-size: 14px; }
@@ -203,7 +325,7 @@ class RecoveryApp(QMainWindow):
         main = QWidget()
         layout = QVBoxLayout()
         
-        layout.addWidget(QLabel("Titan Smart Recovery"))
+        layout.addWidget(QLabel("Titan Smart Recovery (Auto-Detects Video Size)"))
         
         # Drives
         d_layout = QHBoxLayout()
